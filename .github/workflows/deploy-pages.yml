@@ -38,6 +38,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Install Playwright browsers
+        run: playwright install chromium --with-deps
+
       - name: Generate index.html from RSS feed
         run: python generate_index.py
 

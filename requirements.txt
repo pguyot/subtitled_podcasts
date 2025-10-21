@@ -1,2 +1,1 @@
-# No external dependencies required
-# The script uses only Python standard library modules
+playwright>=1.40.0
