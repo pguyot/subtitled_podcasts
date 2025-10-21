@@ -28,3 +28,5 @@ Thumbs.db
 .playwright/
 
 .env
+
+index.html
