@@ -8,9 +8,13 @@ import html
 from datetime import datetime
 from urllib.request import urlopen
 import re
+import os
+from urllib.parse import urlparse, parse_qs
+from playwright.sync_api import sync_playwright
 
 RSS_FEED_URL = "https://rss.dw.com/xml/DKpodcast_alltagsdeutsch_de"
 OUTPUT_FILE = "index.html"
+MANUSCRIPTS_DIR = "manuscripts"
 MAX_EPISODES = 10
 
 HTML_TEMPLATE = """<!DOCTYPE html>
@@ -194,6 +198,94 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             color: #888;
         }}
 
+        .manuscript-link {{
+            background: #ff6b6b;
+        }}
+
+        .manuscript-link:hover {{
+            background: #ee5a5a;
+        }}
+
+        /* Modal styles */
+        .modal {{
+            display: none;
+            position: fixed;
+            z-index: 1000;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            overflow: auto;
+            background-color: rgba(0, 0, 0, 0.7);
+        }}
+
+        .modal-content {{
+            background-color: #fefefe;
+            margin: 5% auto;
+            padding: 0;
+            border: 1px solid #888;
+            width: 90%;
+            max-width: 900px;
+            border-radius: 10px;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+            max-height: 85vh;
+            display: flex;
+            flex-direction: column;
+        }}
+
+        .modal-header {{
+            padding: 20px;
+            background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
+            color: white;
+            border-radius: 10px 10px 0 0;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }}
+
+        .modal-header h2 {{
+            margin: 0;
+            font-size: 1.5rem;
+        }}
+
+        .close {{
+            color: white;
+            font-size: 28px;
+            font-weight: bold;
+            cursor: pointer;
+            background: none;
+            border: none;
+            padding: 0;
+            width: 30px;
+            height: 30px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: transform 0.2s;
+        }}
+
+        .close:hover,
+        .close:focus {{
+            transform: scale(1.2);
+        }}
+
+        .modal-body {{
+            padding: 30px;
+            overflow-y: auto;
+            flex: 1;
+        }}
+
+        .modal-body h3 {{
+            color: #1e3c72;
+            margin-top: 20px;
+            margin-bottom: 10px;
+        }}
+
+        .modal-body p {{
+            line-height: 1.8;
+            margin-bottom: 15px;
+        }}
+
         @media (max-width: 768px) {{
             h1 {{
                 font-size: 2rem;
@@ -206,8 +298,44 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             header {{
                 padding: 30px 20px;
             }}
+
+            .modal-content {{
+                width: 95%;
+                margin: 10% auto;
+                max-height: 80vh;
+            }}
+
+            .modal-body {{
+                padding: 20px;
+            }}
         }}
     </style>
+    <script>
+        function showManuscript(episodeNumber) {{
+            const modal = document.getElementById('manuscript-modal-' + episodeNumber);
+            modal.style.display = 'block';
+        }}
+
+        function closeManuscript(episodeNumber) {{
+            const modal = document.getElementById('manuscript-modal-' + episodeNumber);
+            modal.style.display = 'none';
+        }}
+
+        // Close modal when clicking outside of it
+        window.onclick = function(event) {{
+            if (event.target.classList.contains('modal')) {{
+                event.target.style.display = 'none';
+            }}
+        }}
+
+        // Close modal on Escape key
+        document.addEventListener('keydown', function(event) {{
+            if (event.key === 'Escape') {{
+                const modals = document.querySelectorAll('.modal');
+                modals.forEach(modal => modal.style.display = 'none');
+            }}
+        }});
+    </script>
 </head>
 <body>
     <div class="container">
@@ -256,6 +384,22 @@ EPISODE_TEMPLATE = """                <!-- Episode {number} -->
 {duration}
                         <a href="{link}" class="episode-link" target="_blank">Zur Episode →</a>
 {audio_link}
+{manuscript_button}
+                    </div>
+                </div>
+{manuscript_modal}
+"""
+
+MANUSCRIPT_MODAL_TEMPLATE = """                <!-- Manuscript Modal for Episode {number} -->
+                <div id="manuscript-modal-{number}" class="modal">
+                    <div class="modal-content">
+                        <div class="modal-header">
+                            <h2>📄 Manuskript - {title}</h2>
+                            <button class="close" onclick="closeManuscript({number})">&times;</button>
+                        </div>
+                        <div class="modal-body">
+                            {manuscript_content}
+                        </div>
                     </div>
                 </div>
 """
@@ -344,7 +488,82 @@ def get_element_text(element, tag, default=''):
     return default
 
 
-def generate_episode_html(item, number):
+def get_manuscript_url(episode_link):
+    """
+    Extract manuscript URL from episode link
+    Example: https://learngerman.dw.com/de/sportler-im-abseits/l-19262668?maca=...
+    Returns: https://learngerman.dw.com/de/sportler-im-abseits/l-19262668/lm
+    """
+    if not episode_link or episode_link == '#':
+        return None
+
+    # Remove query string
+    base_url = episode_link.split('?')[0]
+
+    # Add /lm to get the manuscript page
+    manuscript_url = f"{base_url}/lm"
+
+    return manuscript_url
+
+
+def fetch_manuscript(manuscript_url, episode_number):
+    """
+    Fetch manuscript content from the DW website using Playwright
+    Returns the manuscript HTML content or None if not found
+    """
+    if not manuscript_url:
+        return None
+
+    print(f"  Fetching manuscript from {manuscript_url}...")
+
+    try:
+        with sync_playwright() as p:
+            # Launch browser in headless mode
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+
+            # Navigate to the manuscript page
+            page.goto(manuscript_url, wait_until='networkidle', timeout=30000)
+
+            # Wait for the page to load and JavaScript to render
+            page.wait_for_timeout(2000)
+
+            # Find the div containing "Manuskript"
+            # Then find the next richtext-content-container div
+            try:
+                # Look for the section with Manuskript heading
+                manuscript_section = page.locator('div.richtext-content-container').all()
+
+                manuscript_html = None
+                for section in manuscript_section:
+                    # Get the HTML content
+                    content = section.inner_html()
+                    # Check if this section appears after "Manuskript" heading
+                    # We'll take the content if it looks substantial
+                    if content and len(content.strip()) > 100:
+                        manuscript_html = content
+                        break
+
+                browser.close()
+
+                if manuscript_html:
+                    print(f"  ✓ Successfully fetched manuscript for episode {episode_number}")
+                    return manuscript_html
+                else:
+                    print(f"  ✗ Manuscript content not found for episode {episode_number}")
+                    return None
+
+            except Exception as e:
+                print(f"  ✗ Error finding manuscript content: {e}")
+                browser.close()
+                return None
+
+    except Exception as e:
+        print(f"  ✗ Error fetching manuscript: {e}")
+        return None
+
+
+def generate_episode_html(item, number, fetch_manuscripts=True):
     """Generate HTML for a single episode from XML item"""
     # Extract title
     title_text = get_element_text(item, 'title', 'Untitled')
@@ -395,6 +614,23 @@ def generate_episode_html(item, number):
         if formatted_duration:
             duration_html = f'                        <span class="duration">⏱️ {formatted_duration}</span>'
 
+    # Fetch manuscript if enabled
+    manuscript_button = ""
+    manuscript_modal = ""
+    if fetch_manuscripts:
+        manuscript_url = get_manuscript_url(link)
+        if manuscript_url:
+            manuscript_content = fetch_manuscript(manuscript_url, number)
+            if manuscript_content:
+                # Create button
+                manuscript_button = f'                        <button class="episode-link manuscript-link" onclick="showManuscript({number})">📄 Manuskript</button>'
+                # Create modal
+                manuscript_modal = MANUSCRIPT_MODAL_TEMPLATE.format(
+                    number=number,
+                    title=title,
+                    manuscript_content=manuscript_content
+                )
+
     return EPISODE_TEMPLATE.format(
         number=number,
         title=title,
@@ -402,7 +638,9 @@ def generate_episode_html(item, number):
         description=description,
         link=link,
         audio_link=audio_link_html,
-        duration=duration_html
+        duration=duration_html,
+        manuscript_button=manuscript_button,
+        manuscript_modal=manuscript_modal
     )
 
 
@@ -413,8 +651,12 @@ def generate_html(items):
     # Get the first MAX_EPISODES items
     items_to_process = items[:MAX_EPISODES]
 
+    print("\nGenerating HTML for episodes...")
     for i, item in enumerate(items_to_process, 1):
-        episode_html = generate_episode_html(item, i)
+        print(f"\nProcessing episode {i}...")
+        # Only fetch manuscript for the first episode
+        fetch_manuscripts = (i == 1)
+        episode_html = generate_episode_html(item, i, fetch_manuscripts=fetch_manuscripts)
         episodes_html.append(episode_html)
 
     # Get current timestamp
