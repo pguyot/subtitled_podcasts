@@ -206,6 +206,25 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             background: #ee5a5a;
         }}
 
+        /* Audio player styles */
+        .audio-player {{
+            width: 100%;
+            margin: 15px 0;
+            padding: 15px;
+            background: #f8f9fa;
+            border-radius: 8px;
+            border: 1px solid #e0e0e0;
+        }}
+
+        .audio-player audio {{
+            width: 100%;
+            outline: none;
+        }}
+
+        .audio-player audio::-webkit-media-controls-panel {{
+            background-color: #fff;
+        }}
+
         /* Modal styles */
         .modal {{
             display: none;
@@ -379,11 +398,11 @@ EPISODE_TEMPLATE = """                <!-- Episode {number} -->
                     <p class="episode-description">
                         {description}
                     </p>
+{audio_player}
                     <div class="episode-meta">
                         <span class="level-badge">C1 Niveau</span>
 {duration}
                         <a href="{link}" class="episode-link" target="_blank">Zur Episode →</a>
-{audio_link}
 {manuscript_button}
                     </div>
                 </div>
@@ -398,6 +417,7 @@ MANUSCRIPT_MODAL_TEMPLATE = """                <!-- Manuscript Modal for Episode
                             <button class="close" onclick="closeManuscript({number})">&times;</button>
                         </div>
                         <div class="modal-body">
+{modal_audio_player}
                             {manuscript_content}
                         </div>
                     </div>
@@ -598,13 +618,30 @@ def generate_episode_html(item, number, fetch_manuscripts=True):
     # Extract link
     link = get_element_text(item, 'link', '#')
 
-    # Extract audio enclosure
-    audio_link_html = ""
+    # Extract audio enclosure and create audio player
+    audio_player_html = ""
+    modal_audio_player_html = ""
+    audio_url = ""
     enclosure = item.find('enclosure')
     if enclosure is not None:
         audio_url = enclosure.get('url', '')
         if audio_url:
-            audio_link_html = f'                        <a href="{audio_url}" class="episode-link audio-link" target="_blank">🎵 Audio abspielen</a>'
+            # Create embedded audio player for episode card
+            audio_player_html = f'''                    <div class="audio-player">
+                        <audio controls preload="metadata">
+                            <source src="{audio_url}" type="audio/mpeg">
+                            Ihr Browser unterstützt das Audio-Element nicht.
+                        </audio>
+                    </div>'''
+
+            # Create audio player for modal
+            modal_audio_player_html = f'''                            <div class="audio-player">
+                                <audio controls preload="metadata">
+                                    <source src="{audio_url}" type="audio/mpeg">
+                                    Ihr Browser unterstützt das Audio-Element nicht.
+                                </audio>
+                            </div>
+'''
 
     # Extract duration
     duration_html = ""
@@ -624,11 +661,12 @@ def generate_episode_html(item, number, fetch_manuscripts=True):
             if manuscript_content:
                 # Create button
                 manuscript_button = f'                        <button class="episode-link manuscript-link" onclick="showManuscript({number})">📄 Manuskript</button>'
-                # Create modal
+                # Create modal with audio player
                 manuscript_modal = MANUSCRIPT_MODAL_TEMPLATE.format(
                     number=number,
                     title=title,
-                    manuscript_content=manuscript_content
+                    manuscript_content=manuscript_content,
+                    modal_audio_player=modal_audio_player_html
                 )
 
     return EPISODE_TEMPLATE.format(
@@ -637,7 +675,7 @@ def generate_episode_html(item, number, fetch_manuscripts=True):
         date=date_str,
         description=description,
         link=link,
-        audio_link=audio_link_html,
+        audio_player=audio_player_html,
         duration=duration_html,
         manuscript_button=manuscript_button,
         manuscript_modal=manuscript_modal
