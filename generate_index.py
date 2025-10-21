@@ -13,15 +13,47 @@ from urllib.parse import urlparse, parse_qs
 from playwright.sync_api import sync_playwright
 from mistralai import Mistral
 import json
+import time
+import hashlib
+import pickle
 
 RSS_FEED_URL = "https://rss.dw.com/xml/DKpodcast_alltagsdeutsch_de"
 OUTPUT_FILE = "index.html"
 MANUSCRIPTS_DIR = "manuscripts"
+CACHE_DIR = "mistral_cache"
 MAX_EPISODES = 10
+
+# Load environment variables from .env file if present
+def load_env_file():
+    """Load environment variables from .env file if it exists"""
+    env_file = os.path.join(os.path.dirname(__file__), '.env')
+    if os.path.exists(env_file):
+        with open(env_file, 'r') as f:
+            for line in f:
+                line = line.strip()
+                # Skip comments and empty lines
+                if not line or line.startswith('#'):
+                    continue
+                # Parse KEY=VALUE
+                if '=' in line:
+                    key, value = line.split('=', 1)
+                    key = key.strip()
+                    value = value.strip()
+                    # Remove quotes if present
+                    if value.startswith('"') and value.endswith('"'):
+                        value = value[1:-1]
+                    elif value.startswith("'") and value.endswith("'"):
+                        value = value[1:-1]
+                    # Only set if not already in environment
+                    if key not in os.environ:
+                        os.environ[key] = value
+
+# Load .env file before reading environment variables
+load_env_file()
 
 # Mistral API configuration
 MISTRAL_API_KEY = os.environ.get('MISTRAL_API_KEY')
-MISTRAL_MODEL = "mistral-large-latest"
+MISTRAL_MODEL = "open-mistral-nemo-2407"
 
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="de">
@@ -29,6 +61,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Subtitled Podcasts - Alltagsdeutsch</title>
+
+    <!-- Skeleton CSS -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/normalize/8.0.1/normalize.min.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/skeleton/2.0.4/skeleton.min.css">
+
     <style>
         * {{
             margin: 0;
@@ -37,198 +74,196 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         }}
 
         body {{
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
-            line-height: 1.6;
-            color: #333;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-            padding: 20px;
-        }}
-
-        .container {{
-            max-width: 1200px;
+            font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', sans-serif;
+            background: #f2f2f7;
+            max-width: 428px;
             margin: 0 auto;
-            background: white;
-            border-radius: 15px;
-            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            height: 100vh;
             overflow: hidden;
         }}
 
-        header {{
-            background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
-            color: white;
-            padding: 40px;
+        /* iOS-style header */
+        .app-header {{
+            background: rgba(255, 255, 255, 0.8);
+            backdrop-filter: blur(20px);
+            border-bottom: 0.5px solid rgba(0, 0, 0, 0.1);
+            padding: 1rem;
+            position: fixed;
+            top: 0;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 100%;
+            max-width: 428px;
+            z-index: 100;
+        }}
+
+        .app-header h1 {{
+            font-size: 1.5rem;
+            font-weight: 700;
             text-align: center;
+            margin: 0;
         }}
 
-        h1 {{
-            font-size: 2.5rem;
-            margin-bottom: 10px;
+        .back-button {{
+            position: absolute;
+            left: 1rem;
+            top: 50%;
+            transform: translateY(-50%);
+            background: none;
+            border: none;
+            color: #007AFF;
+            font-size: 1rem;
+            cursor: pointer;
+            display: none;
         }}
 
-        .subtitle {{
-            font-size: 1.1rem;
-            opacity: 0.9;
+        /* Episode list view */
+        .episodes-view {{
+            margin-top: 60px;
+            overflow-y: auto;
+            height: calc(100vh - 60px);
+            -webkit-overflow-scrolling: touch;
         }}
 
-        .content {{
-            padding: 40px;
-        }}
-
-        .intro {{
-            background: #f8f9fa;
-            border-left: 4px solid #667eea;
-            padding: 20px;
-            margin-bottom: 30px;
-            border-radius: 5px;
-        }}
-
-        .episodes-list {{
-            display: grid;
-            gap: 20px;
-        }}
-
-        .episode {{
-            background: #fff;
-            border: 1px solid #e0e0e0;
+        .episode-card {{
+            background: white;
+            margin: 10px;
             border-radius: 10px;
-            padding: 25px;
-            transition: all 0.3s ease;
-            box-shadow: 0 2px 5px rgba(0, 0, 0, 0.05);
+            padding: 1rem;
+            cursor: pointer;
+            transition: transform 0.2s;
         }}
 
-        .episode:hover {{
-            transform: translateY(-3px);
-            box-shadow: 0 5px 15px rgba(0, 0, 0, 0.1);
-            border-color: #667eea;
+        .episode-card:active {{
+            transform: scale(0.98);
+        }}
+
+        .episode-header {{
+            display: flex;
+            align-items: center;
+            margin-bottom: 0.5rem;
         }}
 
         .episode-number {{
-            display: inline-block;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: #007AFF;
             color: white;
-            padding: 5px 15px;
-            border-radius: 20px;
-            font-size: 0.85rem;
-            font-weight: bold;
-            margin-bottom: 10px;
-        }}
-
-        .episode-title {{
-            font-size: 1.5rem;
-            color: #1e3c72;
-            margin: 10px 0;
+            font-size: 0.75rem;
             font-weight: 600;
+            padding: 0.25rem 0.5rem;
+            border-radius: 4px;
+            margin-right: 0.5rem;
         }}
 
         .episode-date {{
-            color: #888;
-            font-size: 0.9rem;
-            margin-bottom: 10px;
+            color: #8e8e93;
+            font-size: 0.75rem;
+        }}
+
+        .episode-title {{
+            font-size: 1.1rem;
+            font-weight: 600;
+            margin-bottom: 0.5rem;
+            color: #000;
         }}
 
         .episode-description {{
-            color: #666;
-            margin: 15px 0;
-            line-height: 1.7;
-        }}
-
-        .episode-meta {{
-            display: flex;
-            gap: 15px;
-            margin-top: 15px;
-            flex-wrap: wrap;
-            align-items: center;
-        }}
-
-        .episode-link {{
-            display: inline-block;
-            padding: 8px 16px;
-            background: #667eea;
-            color: white;
-            text-decoration: none;
-            border-radius: 5px;
+            color: #8e8e93;
             font-size: 0.9rem;
-            transition: background 0.3s ease;
+            line-height: 1.4;
         }}
 
-        .episode-link:hover {{
-            background: #5568d3;
+        .chevron {{
+            float: right;
+            color: #c7c7cc;
+            font-size: 1.2rem;
         }}
 
-        .audio-link {{
-            background: #28a745;
+        /* Episode detail view */
+        .episode-detail {{
+            display: none;
+            margin-top: 60px;
+            height: calc(100vh - 60px);
+            overflow-y: auto;
+            -webkit-overflow-scrolling: touch;
+            background: white;
         }}
 
-        .audio-link:hover {{
-            background: #218838;
+        .episode-detail.active {{
+            display: block;
         }}
 
-        .level-badge {{
-            background: #ffc107;
-            color: #333;
-            padding: 5px 12px;
-            border-radius: 5px;
-            font-size: 0.85rem;
-            font-weight: 600;
+        .detail-content {{
+            padding: 1.5rem;
         }}
 
-        .duration {{
-            color: #666;
-            font-size: 0.85rem;
-            padding: 5px 12px;
-            background: #f0f0f0;
-            border-radius: 5px;
+        .detail-title {{
+            font-size: 1.5rem;
+            font-weight: 700;
+            margin-bottom: 0.5rem;
         }}
 
-        footer {{
-            background: #f8f9fa;
-            text-align: center;
-            padding: 20px;
-            color: #666;
+        .detail-meta {{
+            color: #8e8e93;
             font-size: 0.9rem;
+            margin-bottom: 1.5rem;
         }}
 
-        footer a {{
-            color: #667eea;
-            text-decoration: none;
-        }}
-
-        footer a:hover {{
-            text-decoration: underline;
-        }}
-
-        .last-updated {{
-            margin-top: 10px;
-            font-size: 0.85rem;
-            color: #888;
-        }}
-
-        .manuscript-link {{
-            background: #ff6b6b;
-        }}
-
-        .manuscript-link:hover {{
-            background: #ee5a5a;
-        }}
-
-        /* Audio player styles */
         .audio-player {{
-            width: 100%;
-            margin: 15px 0;
-            padding: 15px;
-            background: #f8f9fa;
-            border-radius: 8px;
-            border: 1px solid #e0e0e0;
+            background: #f2f2f7;
+            padding: 1rem;
+            border-radius: 10px;
+            margin-bottom: 1.5rem;
         }}
 
         .audio-player audio {{
             width: 100%;
-            outline: none;
         }}
 
-        .audio-player audio::-webkit-media-controls-panel {{
-            background-color: #fff;
+        /* Transcript section */
+        .transcript-section {{
+            border-top: 0.5px solid #c6c6c8;
+            padding-top: 1rem;
+        }}
+
+        .transcript-toggle {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 1rem;
+            margin: 0 -1.5rem;
+            background: white;
+            border: none;
+            width: calc(100% + 3rem);
+            cursor: pointer;
+            font-size: 1rem;
+            font-weight: 600;
+        }}
+
+        .transcript-toggle:active {{
+            background: #f2f2f7;
+        }}
+
+        .transcript-content {{
+            display: none;
+            padding: 1rem 0;
+            line-height: 1.6;
+        }}
+
+        .transcript-content.visible {{
+            display: block;
+        }}
+
+        .toggle-icon {{
+            color: #8e8e93;
+            transition: transform 0.3s;
+        }}
+
+        .toggle-icon.rotated {{
+            transform: rotate(180deg);
+        }}
+
+        footer {{
+            display: none;
         }}
 
         /* Modal styles */
@@ -241,28 +276,23 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             width: 100%;
             height: 100%;
             overflow: auto;
-            background-color: rgba(0, 0, 0, 0.7);
+            background-color: rgba(0, 0, 0, 0.6);
         }}
 
         .modal-content {{
             background-color: #fefefe;
-            margin: 5% auto;
-            padding: 0;
-            border: 1px solid #888;
+            margin: 3% auto;
             width: 90%;
             max-width: 900px;
-            border-radius: 10px;
-            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
-            max-height: 85vh;
+            border-radius: 4px;
+            max-height: 90vh;
             display: flex;
             flex-direction: column;
         }}
 
         .modal-header {{
-            padding: 20px;
-            background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
-            color: white;
-            border-radius: 10px 10px 0 0;
+            padding: 1.5rem;
+            border-bottom: 1px solid #e1e1e1;
             display: flex;
             justify-content: space-between;
             align-items: center;
@@ -270,71 +300,57 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
         .modal-header h2 {{
             margin: 0;
-            font-size: 1.5rem;
         }}
 
         .close {{
-            color: white;
-            font-size: 28px;
+            font-size: 2rem;
             font-weight: bold;
             cursor: pointer;
             background: none;
             border: none;
-            padding: 0;
-            width: 30px;
-            height: 30px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            transition: transform 0.2s;
+            color: #999;
         }}
 
-        .close:hover,
-        .close:focus {{
-            transform: scale(1.2);
+        .close:hover {{
+            color: #333;
         }}
 
         .modal-body {{
-            padding: 30px;
+            padding: 2rem;
             overflow-y: auto;
             flex: 1;
-        }}
-
-        .modal-body h3 {{
-            color: #1e3c72;
-            margin-top: 20px;
-            margin-bottom: 10px;
+            position: relative;
         }}
 
         .modal-body p {{
             line-height: 1.8;
-            margin-bottom: 15px;
+            margin-bottom: 1rem;
         }}
 
         /* Clickable word styles */
         .word {{
             cursor: pointer;
             padding: 2px 0;
-            border-bottom: 1px dotted #667eea;
+            border-bottom: 1px dotted #33C3F0;
             display: inline-block;
             transition: all 0.2s ease;
         }}
 
         .word:hover {{
-            background-color: #f0f0ff;
-            border-bottom: 2px solid #667eea;
+            background-color: #f0f8ff;
+            border-bottom: 2px solid #33C3F0;
         }}
 
         /* Translation popup */
         .translation-popup {{
             display: none;
-            position: fixed;
+            position: absolute;
             background: white;
-            border: 2px solid #667eea;
-            border-radius: 8px;
-            padding: 15px;
-            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.2);
-            z-index: 10000;
+            border: 1px solid #e1e1e1;
+            border-radius: 4px;
+            padding: 1rem;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+            z-index: 10001;
             max-width: 350px;
             min-width: 250px;
         }}
@@ -346,39 +362,35 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         .translation-popup .word-header {{
             font-size: 1.2rem;
             font-weight: bold;
-            color: #1e3c72;
-            margin-bottom: 10px;
-            padding-bottom: 8px;
-            border-bottom: 2px solid #667eea;
+            color: #333;
+            margin-bottom: 0.5rem;
+            padding-bottom: 0.5rem;
+            border-bottom: 1px solid #e1e1e1;
         }}
 
         .translation-popup .grammar-info {{
-            color: #666;
+            color: #999;
             font-size: 0.85rem;
             font-style: italic;
-            margin-bottom: 8px;
+            margin-bottom: 0.5rem;
         }}
 
         .translation-popup .translation {{
-            color: #333;
+            color: #555;
             font-size: 1rem;
             line-height: 1.5;
-            margin-top: 8px;
+            margin-top: 0.5rem;
         }}
 
         .translation-popup .close-popup {{
             position: absolute;
-            top: 8px;
-            right: 10px;
+            top: 0.5rem;
+            right: 0.5rem;
             cursor: pointer;
-            font-size: 1.3rem;
-            color: #666;
+            font-size: 1.5rem;
+            color: #999;
             background: none;
             border: none;
-            padding: 0;
-            width: 20px;
-            height: 20px;
-            line-height: 1;
         }}
 
         .translation-popup .close-popup:hover {{
@@ -386,18 +398,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         }}
 
         @media (max-width: 768px) {{
-            h1 {{
-                font-size: 2rem;
-            }}
-
-            .content {{
-                padding: 20px;
-            }}
-
-            header {{
-                padding: 30px 20px;
-            }}
-
             .modal-content {{
                 width: 95%;
                 margin: 10% auto;
@@ -405,7 +405,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             }}
 
             .modal-body {{
-                padding: 20px;
+                padding: 1.5rem;
             }}
         }}
     </style>
@@ -447,18 +447,40 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             }}
         }});
 
-        function showTranslation(wordId, event) {{
+        // Add click handlers to all word spans
+        document.addEventListener('DOMContentLoaded', function() {{
+            document.querySelectorAll('.word').forEach(function(wordSpan) {{
+                wordSpan.addEventListener('click', function(event) {{
+                    showTranslation(event);
+                }});
+            }});
+        }});
+
+        function showTranslation(event) {{
             event.stopPropagation();
+
+            const wordId = event.target.getAttribute('data-word-id');
+            if (!wordId) return;
 
             const wordData = wordTranslations[wordId];
             if (!wordData) return;
+
+            // Find the transcript content container
+            const transcriptContent = event.target.closest('.transcript-content');
+            if (!transcriptContent) return;
+
+            // Make transcript content position relative for popup positioning
+            transcriptContent.style.position = 'relative';
 
             let popup = document.getElementById('translation-popup');
             if (!popup) {{
                 popup = document.createElement('div');
                 popup.id = 'translation-popup';
                 popup.className = 'translation-popup';
-                document.body.appendChild(popup);
+                transcriptContent.appendChild(popup);
+            }} else if (popup.parentElement !== transcriptContent) {{
+                // Move popup to correct transcript if it's in a different one
+                transcriptContent.appendChild(popup);
             }}
 
             popup.innerHTML = `
@@ -468,20 +490,30 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 <div class="translation">${{wordData.translation}}</div>
             `;
 
-            // Position the popup near the clicked word
-            const rect = event.target.getBoundingClientRect();
+            // Position the popup near the clicked word relative to transcript-content
+            const wordRect = event.target.getBoundingClientRect();
+            const containerRect = transcriptContent.getBoundingClientRect();
+
             const popupWidth = 300;
             const popupHeight = 150;
 
-            let left = rect.left + window.scrollX;
-            let top = rect.bottom + window.scrollY + 5;
+            // Calculate position relative to transcript-content
+            let left = wordRect.left - containerRect.left;
+            let top = wordRect.bottom - containerRect.top + transcriptContent.scrollTop + 5;
 
-            // Adjust if popup goes off screen
-            if (left + popupWidth > window.innerWidth) {{
-                left = window.innerWidth - popupWidth - 10;
+            // Adjust if popup goes off the container's right edge
+            if (left + popupWidth > transcriptContent.clientWidth) {{
+                left = transcriptContent.clientWidth - popupWidth - 10;
             }}
-            if (top + popupHeight > window.innerHeight + window.scrollY) {{
-                top = rect.top + window.scrollY - popupHeight - 5;
+
+            // Adjust if popup goes off the container's bottom edge
+            if (top + popupHeight > transcriptContent.scrollTop + transcriptContent.clientHeight) {{
+                top = wordRect.top - containerRect.top + transcriptContent.scrollTop - popupHeight - 5;
+            }}
+
+            // Ensure popup doesn't go off the left edge
+            if (left < 0) {{
+                left = 10;
             }}
 
             popup.style.left = left + 'px';
@@ -495,74 +527,125 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 popup.classList.remove('visible');
             }}
         }}
+
+        // iOS-style navigation
+        function showEpisodeDetail(episodeNumber) {{
+            // Hide episodes list
+            document.getElementById('episodesView').style.display = 'none';
+
+            // Hide all episode details
+            document.querySelectorAll('.episode-detail').forEach(detail => {{
+                detail.classList.remove('active');
+            }});
+
+            // Show selected episode detail
+            const detailView = document.getElementById('episode-detail-' + episodeNumber);
+            if (detailView) {{
+                detailView.classList.add('active');
+            }}
+
+            // Show back button
+            document.getElementById('backButton').style.display = 'block';
+
+            // Update header title
+            document.getElementById('headerTitle').textContent = 'Episode ' + episodeNumber;
+        }}
+
+        function showEpisodesList() {{
+            // Hide all episode details
+            document.querySelectorAll('.episode-detail').forEach(detail => {{
+                detail.classList.remove('active');
+            }});
+
+            // Show episodes list
+            document.getElementById('episodesView').style.display = 'block';
+
+            // Hide back button
+            document.getElementById('backButton').style.display = 'none';
+
+            // Reset header title
+            document.getElementById('headerTitle').textContent = 'Alltagsdeutsch';
+        }}
+
+        function toggleTranscript(episodeNumber) {{
+            const content = document.getElementById('transcript-' + episodeNumber);
+            const icon = document.getElementById('toggle-icon-' + episodeNumber);
+
+            if (content.classList.contains('visible')) {{
+                content.classList.remove('visible');
+                icon.classList.remove('rotated');
+            }} else {{
+                content.classList.add('visible');
+                icon.classList.add('rotated');
+            }}
+        }}
     </script>
 </head>
 <body>
-    <div class="container">
-        <header>
-            <h1>🎧 Subtitled Podcasts</h1>
-            <p class="subtitle">Alltagsdeutsch - Deutsche im Alltag</p>
-        </header>
-
-        <div class="content">
-            <div class="intro">
-                <h2>Willkommen!</h2>
-                <p>Hier finden Sie die neuesten Alltagsdeutsch-Podcastfolgen von DW Deutsch lernen. Diese Podcasts sind für fortgeschrittene Deutschlernende (C1-Niveau) konzipiert und behandeln verschiedene Themen aus dem deutschen Alltag.</p>
-            </div>
-
-            <div class="episodes-list">
-{episodes}
-            </div>
-        </div>
-
-        <footer>
-            <p>
-                Quelle: <a href="https://learngerman.dw.com/de/alltagsdeutsch/s-56744441" target="_blank">DW Deutsch lernen - Alltagsdeutsch</a>
-            </p>
-            <p>
-                RSS Feed: <a href="{rss_url}" target="_blank">{rss_url}</a>
-            </p>
-            <p class="last-updated">
-                Zuletzt aktualisiert: {last_updated}
-            </p>
-        </footer>
+    <!-- iOS-style App Header -->
+    <div class="app-header">
+        <button class="back-button" onclick="showEpisodesList()" id="backButton">‹ Zurück</button>
+        <h1 id="headerTitle">Alltagsdeutsch</h1>
     </div>
+
+    <!-- Episodes List View -->
+    <div class="episodes-view" id="episodesView">
+{episodes}
+    </div>
+
+    <!-- Episode Details (one for each episode) -->
+{episode_details}
+
+    <footer>
+        <p>Quelle: DW Deutsch lernen - Alltagsdeutsch</p>
+    </footer>
 </body>
 </html>
 """
 
-EPISODE_TEMPLATE = """                <!-- Episode {number} -->
-                <div class="episode">
-                    <span class="episode-number">Episode {number}</span>
-                    <h3 class="episode-title">{title}</h3>
-                    <p class="episode-date">{date}</p>
-                    <p class="episode-description">
-                        {description}
-                    </p>
-{audio_player}
-                    <div class="episode-meta">
-                        <span class="level-badge">C1 Niveau</span>
-{duration}
-                        <a href="{link}" class="episode-link" target="_blank">Zur Episode →</a>
-{manuscript_button}
-                    </div>
-                </div>
-{manuscript_modal}
+EPISODE_CARD_TEMPLATE = """        <div class="episode-card" onclick="showEpisodeDetail({number})">
+            {illustration}
+            <div class="episode-header">
+                <span class="episode-number">{number}</span>
+                <span class="episode-date">{date}</span>
+                <span class="chevron">›</span>
+            </div>
+            <h3 class="episode-title">{title}</h3>
+            <p class="episode-description">{description}</p>
+        </div>
 """
 
-MANUSCRIPT_MODAL_TEMPLATE = """                <!-- Manuscript Modal for Episode {number} -->
-                <div id="manuscript-modal-{number}" class="modal">
-                    <div class="modal-content">
-                        <div class="modal-header">
-                            <h2>📄 Manuskript - {title}</h2>
-                            <button class="close" onclick="closeManuscript({number})">&times;</button>
-                        </div>
-                        <div class="modal-body">
-{modal_audio_player}
-                            {manuscript_content}
-                        </div>
-                    </div>
+EPISODE_DETAIL_TEMPLATE = """    <div class="episode-detail" id="episode-detail-{number}">
+        <div class="detail-content">
+            {illustration}
+            <h2 class="detail-title">{title}</h2>
+            <p class="detail-meta">{date}{duration}</p>
+
+            <div class="audio-player">
+                <audio controls preload="metadata">
+                    <source src="{audio_url}" type="audio/mpeg">
+                    Ihr Browser unterstützt das Audio-Element nicht.
+                </audio>
+            </div>
+
+            <div class="episode-description" style="margin-bottom: 1.5rem;">
+                {description}
+            </div>
+
+            {transcript_section}
+        </div>
+    </div>
+"""
+
+TRANSCRIPT_SECTION_TEMPLATE = """            <div class="transcript-section">
+                <button class="transcript-toggle" onclick="toggleTranscript({number})">
+                    <span>Manuskript</span>
+                    <span class="toggle-icon" id="toggle-icon-{number}">▼</span>
+                </button>
+                <div class="transcript-content" id="transcript-{number}">
+                    {manuscript_content}
                 </div>
+            </div>
 """
 
 
@@ -606,80 +689,252 @@ def strip_html_tags(text):
     return clean.strip()
 
 
-def translate_words_with_mistral(text, context=""):
+def get_cache_key(prompt):
+    """Generate MD5 hash for cache key"""
+    return hashlib.md5(prompt.encode('utf-8')).hexdigest()
+
+
+def get_from_cache(cache_key):
+    """Retrieve result from cache if it exists"""
+    if not os.path.exists(CACHE_DIR):
+        os.makedirs(CACHE_DIR)
+
+    cache_file = os.path.join(CACHE_DIR, f"{cache_key}.pkl")
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, 'rb') as f:
+                return pickle.load(f)
+        except Exception as e:
+            print(f"  ⚠ Error loading cache: {e}")
+            return None
+    return None
+
+
+def save_to_cache(cache_key, result):
+    """Save result to cache"""
+    if not os.path.exists(CACHE_DIR):
+        os.makedirs(CACHE_DIR)
+
+    cache_file = os.path.join(CACHE_DIR, f"{cache_key}.pkl")
+    try:
+        with open(cache_file, 'wb') as f:
+            pickle.dump(result, f)
+    except Exception as e:
+        print(f"  ⚠ Error saving cache: {e}")
+
+
+def translate_paragraph_with_mistral(paragraph_text, context="", max_retries=3):
     """
-    Translate German words to French with grammatical information using Mistral API
-    Returns a dictionary mapping word IDs to translation data
+    Translate difficult words in a paragraph and return HTML with clickable spans
+    Returns a tuple: (html_with_spans, word_translations_list)
+    """
+    if not MISTRAL_API_KEY:
+        return paragraph_text, []
+
+    # Extract words while preserving order
+    words = re.findall(r'\b\w+\b', paragraph_text)
+    if not words:
+        return paragraph_text, []
+
+    # Calculate how many difficult words to translate (1/3 of total)
+    num_difficult_words = max(1, len(words) // 3)
+
+    client = Mistral(api_key=MISTRAL_API_KEY)
+
+    # Prepare the prompt - simpler approach, just get the words to translate
+    prompt = f"""Tu es un assistant de traduction allemand-français spécialisé dans l'analyse grammaticale.
+
+Contexte global : {context if context else "Texte général en allemand"}
+
+Texte à analyser (paragraphe) :
+{paragraph_text}
+
+TÂCHE:
+Identifie les {num_difficult_words} mots les plus DIFFICILES pour un apprenant de l'allemand (vocabulaire avancé, structures grammaticales complexes, expressions idiomatiques) et fournis pour chacun:
+- Le mot exact tel qu'il apparaît dans le texte
+- Ses informations grammaticales
+- Sa traduction française en contexte
+
+Format de réponse JSON OBLIGATOIRE :
+{{
+  "translations": [
+    {{"word": "mot_exact_1", "grammar": "informations grammaticales", "translation": "traduction en contexte"}},
+    {{"word": "mot_exact_2", "grammar": "informations grammaticales", "translation": "traduction en contexte"}}
+  ]
+}}
+
+RÈGLES:
+- Sélectionne EXACTEMENT {num_difficult_words} mots les plus difficiles
+- Le champ "word" doit contenir le mot EXACT du texte (même capitalisation)
+- Évite les mots faciles (der, die, das, und, aber, ist, hat, etc.)"""
+
+    # Check cache first
+    cache_key = get_cache_key(prompt)
+    cached_result = get_from_cache(cache_key)
+    if cached_result:
+        print(f"    ✓ Using cached translation")
+        html_with_spans = wrap_words_in_spans(paragraph_text, cached_result)
+        return html_with_spans, cached_result
+
+    for attempt in range(max_retries):
+        try:
+            response = client.chat.complete(
+                model=MISTRAL_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"},
+                temperature=0,
+                timeout_ms=60000
+            )
+
+            result = json.loads(response.choices[0].message.content)
+
+            if "translations" in result and isinstance(result["translations"], list) and len(result["translations"]) > 0:
+                # Save to cache
+                save_to_cache(cache_key, result["translations"])
+
+                # Wrap difficult words in spans
+                html_with_spans = wrap_words_in_spans(paragraph_text, result["translations"])
+                return html_with_spans, result["translations"]
+            else:
+                print(f"  ⚠ Invalid response format (attempt {attempt + 1}/{max_retries})")
+                if attempt < max_retries - 1:
+                    time.sleep(2)
+                continue
+
+        except Exception as e:
+            print(f"  ⚠ Error on attempt {attempt + 1}/{max_retries}: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(2)
+                continue
+            else:
+                return paragraph_text, []
+
+    return paragraph_text, []
+
+
+def wrap_words_in_spans(text, translations):
+    """
+    Wrap words from translations list in span tags
+    """
+    # Build a list of words to wrap with their translation index
+    # Handle duplicate words by tracking which occurrence we're on
+    words_to_wrap = {}
+    for i, t in enumerate(translations):
+        word = t["word"]
+        if word not in words_to_wrap:
+            words_to_wrap[word] = []
+        words_to_wrap[word].append(i)
+
+    # Track which occurrence of each word we've seen
+    word_occurrence_counter = {}
+
+    # Split text into parts while preserving everything
+    result_parts = []
+    current_pos = 0
+
+    # Find all word boundaries
+    for match in re.finditer(r'\b(\w+)\b', text):
+        word = match.group(0)
+        start = match.start()
+        end = match.end()
+
+        # Add text before this word
+        if start > current_pos:
+            result_parts.append(text[current_pos:start])
+
+        # Check if this word should be wrapped
+        if word in words_to_wrap:
+            # Track which occurrence of this word we're on
+            if word not in word_occurrence_counter:
+                word_occurrence_counter[word] = 0
+
+            # Get the translation index for this occurrence
+            occurrence_idx = word_occurrence_counter[word]
+            if occurrence_idx < len(words_to_wrap[word]):
+                translation_idx = words_to_wrap[word][occurrence_idx]
+                result_parts.append(f'<span class=\'word\' data-word-id=\'{translation_idx}\'>{word}</span>')
+                word_occurrence_counter[word] += 1
+            else:
+                # More occurrences in text than in translations list
+                result_parts.append(word)
+        else:
+            result_parts.append(word)
+
+        current_pos = end
+
+    # Add remaining text
+    if current_pos < len(text):
+        result_parts.append(text[current_pos:])
+
+    return ''.join(result_parts)
+
+
+def translate_words_with_mistral(text, context="", episode_id="unknown"):
+    """
+    Translate difficult German words to French with grammatical information using Mistral API
+    Processes text paragraph by paragraph and returns HTML with clickable spans
+    Returns a tuple: (html_with_clickable_words, word_translations_dict)
     """
     if not MISTRAL_API_KEY:
         print("  ⚠ Warning: MISTRAL_API_KEY not set. Skipping translations.")
-        return {}
+        return text, {}
 
-    # Extract words from text (clean version without HTML)
+    # Extract paragraphs from HTML while preserving structure
+    # Split by common paragraph tags
+    parts = re.split(r'(<p>|</p>|<br\s*/?>|<strong>|</strong>)', text, flags=re.IGNORECASE)
+
+    if not parts:
+        return text, {}
+
+    # Get clean text for counting
     clean_text = strip_html_tags(text)
-    words = re.findall(r'\b\w+\b', clean_text)
-    if not words:
-        return {}
+    total_words = len(re.findall(r'\b\w+\b', clean_text))
 
-    print(f"  Translating {len(words)} words using Mistral API...")
+    # Extract actual paragraphs (non-tag parts with content)
+    paragraphs = [p.strip() for p in parts if p.strip() and not re.match(r'^<', p)]
 
-    try:
-        client = Mistral(api_key=MISTRAL_API_KEY)
+    print(f"  Translating difficult words from {total_words} total words across {len(paragraphs)} paragraphs using Mistral API...")
 
-        # Prepare the prompt
-        prompt = f"""Tu es un assistant de traduction allemand-français spécialisé dans l'analyse grammaticale.
+    all_word_translations = {}
+    word_id_counter = 0
+    result_parts = []
 
-Pour chaque mot allemand du texte suivant, fournis :
-1. Le mot allemand
-2. Des informations grammaticales (genre et pluriel pour les noms, infinitif pour les verbes, etc.)
-3. La traduction française en contexte
+    for i, part in enumerate(parts):
+        # If it's an HTML tag or empty, keep as-is
+        if not part.strip() or re.match(r'^<', part):
+            result_parts.append(part)
+            continue
 
-Contexte : {context if context else "Texte général en allemand"}
+        para_num = sum(1 for p in parts[:i] if p.strip() and not re.match(r'^<', p)) + 1
+        print(f"    Processing paragraph {para_num}/{len(paragraphs)}...")
 
-Texte à analyser :
-{clean_text}
+        # Get HTML with spans and translations for this paragraph
+        html_with_spans, translations = translate_paragraph_with_mistral(part, context)
 
-Réponds UNIQUEMENT avec un objet JSON valide contenant un tableau d'objets, chaque objet ayant les champs suivants :
-- "word": le mot allemand
-- "grammar": informations grammaticales (ex: "nom masculin, pl: Tage" ou "verbe, infinitif: sein")
-- "translation": la traduction française dans ce contexte
+        # Update word IDs to be unique per episode using DW lesson ID
+        if translations:
+            for translation in translations:
+                old_id = str(translations.index(translation))
+                # Use DW lesson ID for word ID prefix
+                new_id = f"l{episode_id}_w{word_id_counter}"
 
-Format de réponse attendu :
-{{"translations": [{{"word": "das", "grammar": "article défini neutre", "translation": "le"}}, ...]}}
+                # Replace data-word-id in HTML
+                html_with_spans = html_with_spans.replace(f"data-word-id='{old_id}'", f"data-word-id='{new_id}'")
+                html_with_spans = html_with_spans.replace(f'data-word-id="{old_id}"', f'data-word-id="{new_id}"')
 
-Analyse maintenant le texte et réponds avec le JSON."""
-
-        response = client.chat.complete(
-            model=MISTRAL_MODEL,
-            messages=[
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
-            response_format={"type": "json_object"}
-        )
-
-        # Parse the response
-        result = json.loads(response.choices[0].message.content)
-
-        # Create word ID mapping
-        word_translations = {}
-        if "translations" in result:
-            for idx, translation in enumerate(result["translations"]):
-                word_id = f"word_{idx}"
-                word_translations[word_id] = {
+                # Store translation with new ID
+                all_word_translations[new_id] = {
                     "word": translation.get("word", ""),
                     "grammar": translation.get("grammar", ""),
                     "translation": translation.get("translation", "")
                 }
+                word_id_counter += 1
 
-        print(f"  ✓ Successfully translated {len(word_translations)} words")
-        return word_translations
+        result_parts.append(html_with_spans)
 
-    except Exception as e:
-        print(f"  ✗ Error translating with Mistral: {e}")
-        return {}
+    final_html = ''.join(result_parts)
+    print(f"  ✓ Successfully translated {len(all_word_translations)} difficult words")
+    return final_html, all_word_translations
 
 
 def make_words_clickable(html_content, word_translations):
@@ -690,29 +945,55 @@ def make_words_clickable(html_content, word_translations):
     if not word_translations:
         return html_content
 
-    # Parse HTML to find text nodes
-    # This is a simple implementation - for more complex HTML, use BeautifulSoup
     word_index = 0
 
-    def replace_word(match):
+    def replace_text_content(text):
+        """Replace words in plain text (not in HTML tags)"""
         nonlocal word_index
-        word = match.group(0)
 
-        # Skip if we've run out of translations
-        if f"word_{word_index}" not in word_translations:
-            return word
+        # Split text into words while preserving whitespace and punctuation
+        parts = re.split(r'(\s+)', text)
+        result_parts = []
 
-        word_id = f"word_{word_index}"
-        word_index += 1
+        for part in parts:
+            # Check if this part is whitespace
+            if re.match(r'^\s+$', part):
+                result_parts.append(part)
+                continue
 
-        # Return clickable span
-        return f'<span class="word" onclick="showTranslation(\'{word_id}\', event)">{word}</span>'
+            # Extract words from this part (may have punctuation)
+            # Match word + optional punctuation
+            word_match = re.match(r'^(\w+)([\W]*)$', part)
+            if word_match:
+                word = word_match.group(1)
+                punct = word_match.group(2)
 
-    # Replace words outside of HTML tags
-    # This regex matches words that are not inside tags
-    result = re.sub(r'\b(\w+)\b(?=[^<]*(?:>|$))', replace_word, html_content)
+                # Check if we have a translation for this word
+                if f"word_{word_index}" in word_translations:
+                    word_id = f"word_{word_index}"
+                    result_parts.append(f'<span class="word" onclick="showTranslation(\'{word_id}\', event)">{word}</span>{punct}')
+                    word_index += 1
+                else:
+                    result_parts.append(part)
+            else:
+                result_parts.append(part)
 
-    return result
+        return ''.join(result_parts)
+
+    # Process HTML content - split by tags and process only text between tags
+    # This regex splits on HTML tags while keeping the tags
+    parts = re.split(r'(<[^>]+>)', html_content)
+
+    result = []
+    for part in parts:
+        # If it's an HTML tag, keep it as-is
+        if part.startswith('<') and part.endswith('>'):
+            result.append(part)
+        else:
+            # It's text content - make words clickable
+            result.append(replace_text_content(part))
+
+    return ''.join(result)
 
 
 def parse_feed():
@@ -758,6 +1039,23 @@ def get_element_text(element, tag, default=''):
     return default
 
 
+def get_episode_id(episode_link):
+    """
+    Extract DW lesson ID from episode link
+    Example: https://learngerman.dw.com/de/sportler-im-abseits/l-19262668?maca=...
+    Returns: 19262668
+    """
+    if not episode_link or episode_link == '#':
+        return None
+
+    # Extract the lesson ID (format: l-XXXXXXXX)
+    import re
+    match = re.search(r'/l-(\d+)', episode_link)
+    if match:
+        return match.group(1)
+    return None
+
+
 def get_manuscript_url(episode_link):
     """
     Extract manuscript URL from episode link
@@ -778,11 +1076,11 @@ def get_manuscript_url(episode_link):
 
 def fetch_manuscript(manuscript_url, episode_number):
     """
-    Fetch manuscript content from the DW website using Playwright
-    Returns the manuscript HTML content or None if not found
+    Fetch manuscript content and illustration URL from the DW website using Playwright
+    Returns a tuple: (manuscript_html, illustration_url) or (None, None) if not found
     """
     if not manuscript_url:
-        return None
+        return None, None
 
     print(f"  Fetching manuscript from {manuscript_url}...")
 
@@ -814,27 +1112,54 @@ def fetch_manuscript(manuscript_url, episode_number):
                         manuscript_html = content
                         break
 
+                # Fetch illustration URL - look for the poster-container with background-image
+                illustration_url = None
+                try:
+                    # Look for the poster-container div with background-image
+                    poster_container = page.locator('[data-testid="poster-container"]').first
+                    if poster_container:
+                        style = poster_container.get_attribute('style')
+                        if style:
+                            # Extract URL from background-image: url("...")
+                            import re
+                            match = re.search(r'background-image:\s*url\(["\']?([^"\']+)["\']?\)', style)
+                            if match:
+                                illustration_url = match.group(1)
+                                # Make sure it's an absolute URL
+                                if illustration_url.startswith('//'):
+                                    illustration_url = 'https:' + illustration_url
+                                elif illustration_url.startswith('/'):
+                                    illustration_url = 'https://learngerman.dw.com' + illustration_url
+
+                    if illustration_url:
+                        print(f"  ✓ Found illustration: {illustration_url}")
+                except Exception as e:
+                    print(f"  ⚠ Could not fetch illustration: {e}")
+
                 browser.close()
 
                 if manuscript_html:
                     print(f"  ✓ Successfully fetched manuscript for episode {episode_number}")
-                    return manuscript_html
+                    return manuscript_html, illustration_url
                 else:
                     print(f"  ✗ Manuscript content not found for episode {episode_number}")
-                    return None
+                    return None, None
 
             except Exception as e:
                 print(f"  ✗ Error finding manuscript content: {e}")
                 browser.close()
-                return None
+                return None, None
 
     except Exception as e:
         print(f"  ✗ Error fetching manuscript: {e}")
-        return None
+        return None, None
 
 
 def generate_episode_html(item, number, fetch_manuscripts=True, word_translations_dict=None):
-    """Generate HTML for a single episode from XML item"""
+    """
+    Generate HTML for a single episode from XML item
+    Returns a tuple: (episode_card_html, episode_detail_html)
+    """
     if word_translations_dict is None:
         word_translations_dict = {}
 
@@ -864,37 +1189,20 @@ def generate_episode_html(item, number, fetch_manuscripts=True, word_translation
     # Clean HTML tags from description
     description = strip_html_tags(description_text)
     description = html.escape(description)
-    # Limit description length
-    if len(description) > 300:
-        description = description[:297] + "..."
+
+    # Keep full description for detail view, but limit for card view
+    description_short = description
+    if len(description) > 150:
+        description_short = description[:147] + "..."
 
     # Extract link
     link = get_element_text(item, 'link', '#')
 
-    # Extract audio enclosure and create audio player
-    audio_player_html = ""
-    modal_audio_player_html = ""
+    # Extract audio enclosure
     audio_url = ""
     enclosure = item.find('enclosure')
     if enclosure is not None:
         audio_url = enclosure.get('url', '')
-        if audio_url:
-            # Create embedded audio player for episode card
-            audio_player_html = f'''                    <div class="audio-player">
-                        <audio controls preload="metadata">
-                            <source src="{audio_url}" type="audio/mpeg">
-                            Ihr Browser unterstützt das Audio-Element nicht.
-                        </audio>
-                    </div>'''
-
-            # Create audio player for modal
-            modal_audio_player_html = f'''                            <div class="audio-player">
-                                <audio controls preload="metadata">
-                                    <source src="{audio_url}" type="audio/mpeg">
-                                    Ihr Browser unterstützt das Audio-Element nicht.
-                                </audio>
-                            </div>
-'''
 
     # Extract duration
     duration_html = ""
@@ -902,51 +1210,68 @@ def generate_episode_html(item, number, fetch_manuscripts=True, word_translation
     if duration:
         formatted_duration = format_duration(duration)
         if formatted_duration:
-            duration_html = f'                        <span class="duration">⏱️ {formatted_duration}</span>'
+            duration_html = f' • {formatted_duration}'
 
     # Fetch manuscript if enabled
-    manuscript_button = ""
-    manuscript_modal = ""
+    transcript_section = ""
+    illustration_html = ""
+    illustration_card_html = ""
     if fetch_manuscripts:
         manuscript_url = get_manuscript_url(link)
         if manuscript_url:
-            manuscript_content = fetch_manuscript(manuscript_url, number)
+            manuscript_content, illustration_url = fetch_manuscript(manuscript_url, number)
             if manuscript_content:
-                # Translate words in the manuscript
-                word_translations = translate_words_with_mistral(manuscript_content, context=title_text)
+                # Extract DW lesson ID from the episode link
+                episode_id = get_episode_id(link) or str(number)  # fallback to number if ID not found
 
-                # Make words clickable
+                # Translate difficult words in the manuscript and get HTML with clickable spans
+                manuscript_content, word_translations = translate_words_with_mistral(manuscript_content, context=title_text, episode_id=episode_id)
+
+                # Store translations for this episode
                 if word_translations:
-                    manuscript_content = make_words_clickable(manuscript_content, word_translations)
-                    # Store translations for this episode
                     word_translations_dict[f"episode_{number}"] = word_translations
 
-                # Create button
-                manuscript_button = f'                        <button class="episode-link manuscript-link" onclick="showManuscript({number})">📄 Manuskript</button>'
-                # Create modal with audio player
-                manuscript_modal = MANUSCRIPT_MODAL_TEMPLATE.format(
+                # Generate transcript section
+                transcript_section = TRANSCRIPT_SECTION_TEMPLATE.format(
                     number=number,
-                    title=title,
-                    manuscript_content=manuscript_content,
-                    modal_audio_player=modal_audio_player_html
+                    manuscript_content=manuscript_content
                 )
 
-    return EPISODE_TEMPLATE.format(
+            # Generate illustration HTML if URL was found
+            if illustration_url:
+                # Full size for detail view
+                illustration_html = f'<img src="{illustration_url}" alt="{title}" class="episode-illustration" style="width: 100%; border-radius: 10px; margin-bottom: 1.5rem;">'
+                # Smaller version for card view
+                illustration_card_html = f'<img src="{illustration_url}" alt="{title}" class="episode-illustration-card" style="width: 100%; border-radius: 8px; margin-bottom: 0.75rem;">'
+
+    # Generate episode card (for list view)
+    episode_card = EPISODE_CARD_TEMPLATE.format(
+        number=number,
+        date=date_str,
+        title=title,
+        description=description_short,
+        illustration=illustration_card_html
+    )
+
+    # Generate episode detail (for detail view)
+    episode_detail = EPISODE_DETAIL_TEMPLATE.format(
         number=number,
         title=title,
         date=date_str,
-        description=description,
-        link=link,
-        audio_player=audio_player_html,
         duration=duration_html,
-        manuscript_button=manuscript_button,
-        manuscript_modal=manuscript_modal
+        audio_url=audio_url if audio_url else "",
+        description=description,
+        illustration=illustration_html,
+        transcript_section=transcript_section
     )
+
+    return episode_card, episode_detail
 
 
 def generate_html(items):
     """Generate complete HTML page from XML items"""
-    episodes_html = []
+    episode_cards = []
+    episode_details = []
     all_word_translations = {}
 
     # Get the first MAX_EPISODES items
@@ -955,14 +1280,15 @@ def generate_html(items):
     print("\nGenerating HTML for episodes...")
     for i, item in enumerate(items_to_process, 1):
         print(f"\nProcessing episode {i}...")
-        # Only fetch manuscript for the first episode
-        fetch_manuscripts = (i == 1)
-        episode_html = generate_episode_html(item, i, fetch_manuscripts=fetch_manuscripts,
-                                             word_translations_dict=all_word_translations)
-        episodes_html.append(episode_html)
-
-    # Get current timestamp
-    last_updated = datetime.now().strftime('%d.%m.%Y %H:%M:%S UTC')
+        # Fetch manuscript for all episodes
+        fetch_manuscripts = True
+        episode_card, episode_detail = generate_episode_html(
+            item, i,
+            fetch_manuscripts=fetch_manuscripts,
+            word_translations_dict=all_word_translations
+        )
+        episode_cards.append(episode_card)
+        episode_details.append(episode_detail)
 
     # Merge all word translations into a single dictionary
     merged_translations = {}
@@ -974,9 +1300,8 @@ def generate_html(items):
 
     # Generate final HTML
     html_content = HTML_TEMPLATE.format(
-        episodes="\n".join(episodes_html),
-        rss_url=RSS_FEED_URL,
-        last_updated=last_updated,
+        episodes="\n".join(episode_cards),
+        episode_details="\n".join(episode_details),
         word_translations_data=word_translations_json
     )
 
