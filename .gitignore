@@ -26,3 +26,5 @@ Thumbs.db
 
 # Playwright
 .playwright/
+
+.env
