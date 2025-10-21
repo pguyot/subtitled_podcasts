@@ -43,6 +43,8 @@ jobs:
 
       - name: Generate index.html from RSS feed
         run: python generate_index.py
+        env:
+          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
 
       - name: Setup Pages
         uses: actions/configure-pages@v4

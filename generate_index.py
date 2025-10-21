@@ -11,11 +11,17 @@ import re
 import os
 from urllib.parse import urlparse, parse_qs
 from playwright.sync_api import sync_playwright
+from mistralai import Mistral
+import json
 
 RSS_FEED_URL = "https://rss.dw.com/xml/DKpodcast_alltagsdeutsch_de"
 OUTPUT_FILE = "index.html"
 MANUSCRIPTS_DIR = "manuscripts"
 MAX_EPISODES = 10
+
+# Mistral API configuration
+MISTRAL_API_KEY = os.environ.get('MISTRAL_API_KEY')
+MISTRAL_MODEL = "mistral-large-latest"
 
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="de">
@@ -305,6 +311,80 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             margin-bottom: 15px;
         }}
 
+        /* Clickable word styles */
+        .word {{
+            cursor: pointer;
+            padding: 2px 0;
+            border-bottom: 1px dotted #667eea;
+            display: inline-block;
+            transition: all 0.2s ease;
+        }}
+
+        .word:hover {{
+            background-color: #f0f0ff;
+            border-bottom: 2px solid #667eea;
+        }}
+
+        /* Translation popup */
+        .translation-popup {{
+            display: none;
+            position: fixed;
+            background: white;
+            border: 2px solid #667eea;
+            border-radius: 8px;
+            padding: 15px;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.2);
+            z-index: 10000;
+            max-width: 350px;
+            min-width: 250px;
+        }}
+
+        .translation-popup.visible {{
+            display: block;
+        }}
+
+        .translation-popup .word-header {{
+            font-size: 1.2rem;
+            font-weight: bold;
+            color: #1e3c72;
+            margin-bottom: 10px;
+            padding-bottom: 8px;
+            border-bottom: 2px solid #667eea;
+        }}
+
+        .translation-popup .grammar-info {{
+            color: #666;
+            font-size: 0.85rem;
+            font-style: italic;
+            margin-bottom: 8px;
+        }}
+
+        .translation-popup .translation {{
+            color: #333;
+            font-size: 1rem;
+            line-height: 1.5;
+            margin-top: 8px;
+        }}
+
+        .translation-popup .close-popup {{
+            position: absolute;
+            top: 8px;
+            right: 10px;
+            cursor: pointer;
+            font-size: 1.3rem;
+            color: #666;
+            background: none;
+            border: none;
+            padding: 0;
+            width: 20px;
+            height: 20px;
+            line-height: 1;
+        }}
+
+        .translation-popup .close-popup:hover {{
+            color: #333;
+        }}
+
         @media (max-width: 768px) {{
             h1 {{
                 font-size: 2rem;
@@ -330,6 +410,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         }}
     </style>
     <script>
+        // Word translation data
+        const wordTranslations = {word_translations_data};
+
         function showManuscript(episodeNumber) {{
             const modal = document.getElementById('manuscript-modal-' + episodeNumber);
             modal.style.display = 'block';
@@ -345,6 +428,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             if (event.target.classList.contains('modal')) {{
                 event.target.style.display = 'none';
             }}
+            // Close translation popup if clicking outside
+            const popup = document.getElementById('translation-popup');
+            if (popup && !event.target.classList.contains('word') && !popup.contains(event.target)) {{
+                popup.classList.remove('visible');
+            }}
         }}
 
         // Close modal on Escape key
@@ -352,8 +440,61 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             if (event.key === 'Escape') {{
                 const modals = document.querySelectorAll('.modal');
                 modals.forEach(modal => modal.style.display = 'none');
+                const popup = document.getElementById('translation-popup');
+                if (popup) {{
+                    popup.classList.remove('visible');
+                }}
             }}
         }});
+
+        function showTranslation(wordId, event) {{
+            event.stopPropagation();
+
+            const wordData = wordTranslations[wordId];
+            if (!wordData) return;
+
+            let popup = document.getElementById('translation-popup');
+            if (!popup) {{
+                popup = document.createElement('div');
+                popup.id = 'translation-popup';
+                popup.className = 'translation-popup';
+                document.body.appendChild(popup);
+            }}
+
+            popup.innerHTML = `
+                <button class="close-popup" onclick="closeTranslationPopup()">&times;</button>
+                <div class="word-header">${{wordData.word}}</div>
+                <div class="grammar-info">${{wordData.grammar}}</div>
+                <div class="translation">${{wordData.translation}}</div>
+            `;
+
+            // Position the popup near the clicked word
+            const rect = event.target.getBoundingClientRect();
+            const popupWidth = 300;
+            const popupHeight = 150;
+
+            let left = rect.left + window.scrollX;
+            let top = rect.bottom + window.scrollY + 5;
+
+            // Adjust if popup goes off screen
+            if (left + popupWidth > window.innerWidth) {{
+                left = window.innerWidth - popupWidth - 10;
+            }}
+            if (top + popupHeight > window.innerHeight + window.scrollY) {{
+                top = rect.top + window.scrollY - popupHeight - 5;
+            }}
+
+            popup.style.left = left + 'px';
+            popup.style.top = top + 'px';
+            popup.classList.add('visible');
+        }}
+
+        function closeTranslationPopup() {{
+            const popup = document.getElementById('translation-popup');
+            if (popup) {{
+                popup.classList.remove('visible');
+            }}
+        }}
     </script>
 </head>
 <body>
@@ -463,6 +604,115 @@ def strip_html_tags(text):
     # Remove HTML tags
     clean = re.sub('<.*?>', '', text)
     return clean.strip()
+
+
+def translate_words_with_mistral(text, context=""):
+    """
+    Translate German words to French with grammatical information using Mistral API
+    Returns a dictionary mapping word IDs to translation data
+    """
+    if not MISTRAL_API_KEY:
+        print("  ⚠ Warning: MISTRAL_API_KEY not set. Skipping translations.")
+        return {}
+
+    # Extract words from text (clean version without HTML)
+    clean_text = strip_html_tags(text)
+    words = re.findall(r'\b\w+\b', clean_text)
+    if not words:
+        return {}
+
+    print(f"  Translating {len(words)} words using Mistral API...")
+
+    try:
+        client = Mistral(api_key=MISTRAL_API_KEY)
+
+        # Prepare the prompt
+        prompt = f"""Tu es un assistant de traduction allemand-français spécialisé dans l'analyse grammaticale.
+
+Pour chaque mot allemand du texte suivant, fournis :
+1. Le mot allemand
+2. Des informations grammaticales (genre et pluriel pour les noms, infinitif pour les verbes, etc.)
+3. La traduction française en contexte
+
+Contexte : {context if context else "Texte général en allemand"}
+
+Texte à analyser :
+{clean_text}
+
+Réponds UNIQUEMENT avec un objet JSON valide contenant un tableau d'objets, chaque objet ayant les champs suivants :
+- "word": le mot allemand
+- "grammar": informations grammaticales (ex: "nom masculin, pl: Tage" ou "verbe, infinitif: sein")
+- "translation": la traduction française dans ce contexte
+
+Format de réponse attendu :
+{{"translations": [{{"word": "das", "grammar": "article défini neutre", "translation": "le"}}, ...]}}
+
+Analyse maintenant le texte et réponds avec le JSON."""
+
+        response = client.chat.complete(
+            model=MISTRAL_MODEL,
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            response_format={"type": "json_object"}
+        )
+
+        # Parse the response
+        result = json.loads(response.choices[0].message.content)
+
+        # Create word ID mapping
+        word_translations = {}
+        if "translations" in result:
+            for idx, translation in enumerate(result["translations"]):
+                word_id = f"word_{idx}"
+                word_translations[word_id] = {
+                    "word": translation.get("word", ""),
+                    "grammar": translation.get("grammar", ""),
+                    "translation": translation.get("translation", "")
+                }
+
+        print(f"  ✓ Successfully translated {len(word_translations)} words")
+        return word_translations
+
+    except Exception as e:
+        print(f"  ✗ Error translating with Mistral: {e}")
+        return {}
+
+
+def make_words_clickable(html_content, word_translations):
+    """
+    Process HTML content to make each word clickable
+    Returns modified HTML with clickable words
+    """
+    if not word_translations:
+        return html_content
+
+    # Parse HTML to find text nodes
+    # This is a simple implementation - for more complex HTML, use BeautifulSoup
+    word_index = 0
+
+    def replace_word(match):
+        nonlocal word_index
+        word = match.group(0)
+
+        # Skip if we've run out of translations
+        if f"word_{word_index}" not in word_translations:
+            return word
+
+        word_id = f"word_{word_index}"
+        word_index += 1
+
+        # Return clickable span
+        return f'<span class="word" onclick="showTranslation(\'{word_id}\', event)">{word}</span>'
+
+    # Replace words outside of HTML tags
+    # This regex matches words that are not inside tags
+    result = re.sub(r'\b(\w+)\b(?=[^<]*(?:>|$))', replace_word, html_content)
+
+    return result
 
 
 def parse_feed():
@@ -583,8 +833,11 @@ def fetch_manuscript(manuscript_url, episode_number):
         return None
 
 
-def generate_episode_html(item, number, fetch_manuscripts=True):
+def generate_episode_html(item, number, fetch_manuscripts=True, word_translations_dict=None):
     """Generate HTML for a single episode from XML item"""
+    if word_translations_dict is None:
+        word_translations_dict = {}
+
     # Extract title
     title_text = get_element_text(item, 'title', 'Untitled')
     title = html.escape(title_text)
@@ -659,6 +912,15 @@ def generate_episode_html(item, number, fetch_manuscripts=True):
         if manuscript_url:
             manuscript_content = fetch_manuscript(manuscript_url, number)
             if manuscript_content:
+                # Translate words in the manuscript
+                word_translations = translate_words_with_mistral(manuscript_content, context=title_text)
+
+                # Make words clickable
+                if word_translations:
+                    manuscript_content = make_words_clickable(manuscript_content, word_translations)
+                    # Store translations for this episode
+                    word_translations_dict[f"episode_{number}"] = word_translations
+
                 # Create button
                 manuscript_button = f'                        <button class="episode-link manuscript-link" onclick="showManuscript({number})">📄 Manuskript</button>'
                 # Create modal with audio player
@@ -685,6 +947,7 @@ def generate_episode_html(item, number, fetch_manuscripts=True):
 def generate_html(items):
     """Generate complete HTML page from XML items"""
     episodes_html = []
+    all_word_translations = {}
 
     # Get the first MAX_EPISODES items
     items_to_process = items[:MAX_EPISODES]
@@ -694,17 +957,27 @@ def generate_html(items):
         print(f"\nProcessing episode {i}...")
         # Only fetch manuscript for the first episode
         fetch_manuscripts = (i == 1)
-        episode_html = generate_episode_html(item, i, fetch_manuscripts=fetch_manuscripts)
+        episode_html = generate_episode_html(item, i, fetch_manuscripts=fetch_manuscripts,
+                                             word_translations_dict=all_word_translations)
         episodes_html.append(episode_html)
 
     # Get current timestamp
     last_updated = datetime.now().strftime('%d.%m.%Y %H:%M:%S UTC')
 
+    # Merge all word translations into a single dictionary
+    merged_translations = {}
+    for episode_key, translations in all_word_translations.items():
+        merged_translations.update(translations)
+
+    # Convert translations to JSON
+    word_translations_json = json.dumps(merged_translations, ensure_ascii=False)
+
     # Generate final HTML
     html_content = HTML_TEMPLATE.format(
         episodes="\n".join(episodes_html),
         rss_url=RSS_FEED_URL,
-        last_updated=last_updated
+        last_updated=last_updated,
+        word_translations_data=word_translations_json
     )
 
     return html_content
